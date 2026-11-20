@@ -572,13 +572,85 @@ do_install() {
 do_uninstall() {
   need_root
   [[ -n "$INSTALL_DIR" ]] || INSTALL_DIR="$(find_existing_install || true)"
-  [[ -n "$INSTALL_DIR" ]] || die "No installation found"
-  local a; a=$(ask "Type YES to remove the panel, its database and all uploads" "no")
-  [[ "$a" == "YES" ]] || { echo "Cancelled."; return; }
+  [[ -n "$INSTALL_DIR" ]] || { warn "No JAZZ panel installation found"; return 0; }
+  : >> "$LOG_FILE"
+  echo "${R}-------- Uninstall JAZZ VPS MANAGEMENT PANEL --------${D}"
+  echo " Installed in: $INSTALL_DIR"
+  echo
+
+  yesno "1) Remove the panel? (PM2 process '$PM2_NAME', jazz-panel command, all panel files)" "n" || { echo "Cancelled."; return 0; }
+
+  local rm_deps=0 rm_lxd=0 rm_db=0
+  yesno "2) Remove the dependencies installed for the panel? (PM2, Node.js, sshx, tmate, quota)" "n" && rm_deps=1
+  if command -v lxc >/dev/null 2>&1; then
+    if yesno "3) Remove LXD too?  ${R}WARNING: this DELETES ALL VPS containers and images${D}" "n"; then
+      yesno "   Are you really sure? ALL VPS data will be lost" "n" && rm_lxd=1
+    fi
+  fi
+  yesno "4) Delete the database? (all users, VPS records, settings, uploads)" "n" && rm_db=1
+
+  echo
+  echo " Summary:"
+  echo "   panel files + PM2 process + jazz-panel command : REMOVE"
+  echo "   dependencies (PM2, Node.js, sshx, tmate, quota) : $( ((rm_deps)) && echo REMOVE || echo keep)"
+  echo "   LXD + all VPS containers                        : $( ((rm_lxd)) && echo REMOVE || echo keep)"
+  echo "   database                                        : $( ((rm_db)) && echo DELETE || echo "keep (backup saved in /root)")"
+  yesno "Proceed with uninstall?" "n" || { echo "Cancelled."; return 0; }
+  echo
+
+  # --- panel process + command ---
   quiet pm2 delete "$PM2_NAME"; quiet pm2 save --force
+  ok "PM2 process removed"
+
+  # --- database: keep a backup unless the user wants it gone ---
+  if (( ! rm_db )); then
+    local bk="/root/jazz-panel-backup-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$bk"
+    [[ -f "$INSTALL_DIR/hvm.db" ]] && cp -a "$INSTALL_DIR/hvm.db" "$bk/"
+    [[ -f "$INSTALL_DIR/.env" ]] && cp -a "$INSTALL_DIR/.env" "$bk/"
+    [[ -d "$INSTALL_DIR/static/uploads" ]] && cp -a "$INSTALL_DIR/static/uploads" "$bk/"
+    ok "Database kept: $bk"
+  fi
   rm -f "$CLI_PATH"
-  ( sleep 1; rm -rf "$INSTALL_DIR" ) &
-  ok "Panel removed. LXD containers (your VPS) were NOT touched."
+  rm -rf "$INSTALL_DIR"
+  ok "Panel files + jazz-panel command removed"
+
+  # --- dependencies ---
+  if (( rm_deps )); then
+    local others=0
+    others=$(pm2 jlist 2>/dev/null | python3 -c "
+import sys,json
+try: print(len(json.load(sys.stdin)))
+except Exception: print(0)" 2>/dev/null || echo 0)
+    if (( others > 0 )); then
+      warn "PM2 still runs $others other app(s) - PM2 and Node.js are kept"
+    else
+      quiet pm2 uninstall pm2-logrotate
+      quiet pm2 unstartup systemd
+      quiet systemctl disable --now pm2-root
+      quiet npm uninstall -g pm2 && ok "PM2 removed"
+      quiet apt-get remove -y --purge nodejs && ok "Node.js removed"
+      rm -f /etc/apt/sources.list.d/nodesource.list /etc/apt/keyrings/nodesource.gpg /usr/share/keyrings/nodesource.gpg
+      rm -rf /root/.pm2
+    fi
+    quiet apt-get remove -y --purge tmate quota && ok "tmate + quota removed"
+    rm -f /usr/local/bin/sshx /root/.sshx && ok "sshx removed"
+    quiet apt-get autoremove -y
+  fi
+
+  # --- LXD ---
+  if (( rm_lxd )); then
+    info "Deleting all LXD containers (this can take a while)..."
+    local n
+    for n in $(lxc list -c n --format csv 2>/dev/null); do quiet lxc delete "$n" --force; done
+    quiet snap remove --purge lxd && ok "LXD removed"
+    rm -f /usr/local/bin/lxc /usr/local/bin/lxd
+  fi
+
+  echo
+  echo "${G}JAZZ VPS MANAGEMENT PANEL has been uninstalled.${D}"
+  echo " (system packages like python3, curl, git were left in place - other software may need them)"
+  INSTALL_DIR=""
 }
 
 pm2_action() { need_root; local cli; [[ -x "$CLI_PATH" ]] || die "Panel is not installed yet"; "$CLI_PATH" "$1"; }
