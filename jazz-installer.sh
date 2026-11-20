@@ -107,6 +107,8 @@ fetch_panel() {  # fetch_panel <dest> : download latest panel files from GitHub 
   w="$(mktemp -d)"
   if [[ -n "${JAZZ_SOURCE_ZIP:-}" ]]; then
     zip="$JAZZ_SOURCE_ZIP"; info "Using local panel zip: $zip"
+  elif [[ -f "$(dirname "$SELF")/$JAZZ_ZIP" ]]; then
+    zip="$(dirname "$SELF")/$JAZZ_ZIP"; info "Using panel zip next to the installer: $zip"
   else
     info "Downloading panel files from GitHub: $JAZZ_REPO ($JAZZ_BRANCH)"
     if GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "$JAZZ_BRANCH" "https://github.com/$JAZZ_REPO.git" "$w/repo" >>"$LOG_FILE" 2>&1; then
@@ -129,7 +131,7 @@ fetch_panel() {  # fetch_panel <dest> : download latest panel files from GitHub 
   [[ -f "$w/repo/jazz-installer.sh" ]] && grep -q "^fetch_panel()" "$w/repo/jazz-installer.sh" && cp -f "$w/repo/jazz-installer.sh" "$dest/jazz-installer.sh"
   ( cd "$root" && tar cf - --exclude='.git' --exclude='__pycache__' --exclude='.trashed-*' --exclude='*.pyc' --exclude='hvm.db' . ) | tar xf - -C "$dest"
   rm -rf "$w"
-  ok "Panel files downloaded"
+  ok "Panel files unpacked"
 }
 
 # ---------- install location ----------
