@@ -246,8 +246,42 @@ install_node_pm2() {
   quiet pm2 install pm2-logrotate && quiet pm2 set pm2-logrotate:max_size 20M && quiet pm2 set pm2-logrotate:retain 7
 }
 
+# Make sure LXD has storage pool "default" (+ root disk on the default profile + lxdbr0 network).
+# The panel needs a pool it can grow and put quotas on, so prefer zfs, then btrfs; "dir" is the last resort.
+ensure_lxd_pool() {
+  command -v lxc >/dev/null 2>&1 || { warn "lxc command not found"; return 1; }
+  quiet lxd waitready --timeout 120
+  if lxc storage show default >/dev/null 2>&1; then
+    ok "LXD storage pool 'default' exists"
+  else
+    local avail size drv created=0
+    avail=$(df -BG --output=avail /var/snap 2>/dev/null | tail -1 | tr -dc '0-9'); [[ -n "$avail" ]] || avail=20
+    size=$(( avail * 6 / 10 )); (( size > 30 )) && size=30; (( size < 5 )) && size=5
+    for drv in zfs btrfs dir; do
+      if [[ $drv == dir ]]; then
+        quiet lxc storage create default dir && created=1
+      else
+        quiet lxc storage create default "$drv" "size=${size}GiB" && created=1
+      fi
+      if (( created )); then ok "Created LXD storage pool 'default' ($drv$( [[ $drv != dir ]] && echo ", ${size}GiB loop-backed"))"; break; fi
+      warn "storage driver '$drv' not available on this kernel - trying next"
+    done
+    (( created )) || { err "Could not create storage pool 'default' (see $LOG_FILE)"; return 1; }
+  fi
+  # default profile: root disk on pool 'default'
+  if lxc profile device show default 2>/dev/null | grep -q '^root:'; then
+    quiet lxc profile device set default root pool default
+  else
+    quiet lxc profile device add default root disk path=/ pool=default
+  fi
+  # network bridge + nic
+  lxc network show lxdbr0 >/dev/null 2>&1 || quiet lxc network create lxdbr0 ipv4.address=auto ipv4.nat=true ipv6.address=none
+  lxc profile device show default 2>/dev/null | grep -q '^eth0:' || quiet lxc profile device add default eth0 nic network=lxdbr0 name=eth0
+  ok "LXD ready (pool 'default', network lxdbr0)"
+}
+
 install_lxd() {
-  if command -v lxc >/dev/null 2>&1 && quiet lxc info; then ok "LXD already installed and running"; return 0; fi
+  if command -v lxc >/dev/null 2>&1 && quiet lxc info; then ok "LXD already installed and running"; ensure_lxd_pool; return $?; fi
   info "Installing LXD (container engine used to create VPS)"
   quiet systemctl enable --now snapd.socket snapd.service
   quiet snap wait system seed.loaded
@@ -257,10 +291,60 @@ install_lxd() {
     run "Installing LXD snap" snap install lxd || { warn "LXD install failed - panel will still work, but VPS creation needs LXD"; return 1; }
   fi
   ln -sf /snap/bin/lxc /usr/local/bin/lxc 2>/dev/null; ln -sf /snap/bin/lxd /usr/local/bin/lxd 2>/dev/null
-  if ! quiet lxc storage show default; then
-    run "Initialising LXD (storage pool 'default' + lxdbr0 network)" lxd init --auto || warn "lxd init failed - run 'lxd init --auto' manually"
+  ensure_lxd_pool
+}
+
+do_fix_lxd() {
+  need_root; : >> "$LOG_FILE"
+  info "Checking / repairing LXD (VPS creation error: storage pool 'default' not found)"
+  install_lxd || die "LXD repair failed"
+  echo; lxc storage list; echo
+  ok "Done. Try creating the VPS again in the panel (no restart needed)."
+}
+
+# ---------- per-VPS dedicated disk (shared hosting accounts get their own ext4 loop volume) ----------
+loop_selftest() {  # create a 64MB image, mkfs, loop-mount it, read df, clean up. Prints the real error on failure.
+  local d=/opt/hvm-shared/disks img m err
+  mkdir -p "$d"; img="$d/.selftest.img"; m="$(mktemp -d)"
+  rm -f "$img"; truncate -s 64M "$img" 2>/dev/null || { err "Not enough disk space to create a test image"; return 1; }
+  mkfs.ext4 -F -q "$img" >>"$LOG_FILE" 2>&1 || { err "mkfs.ext4 failed"; rm -f "$img"; return 1; }
+  if err=$(mount -o loop,noatime "$img" "$m" 2>&1); then
+    ok "Loop-mount test passed: a 64MB volume shows as $(df -h --output=size "$m" | tail -1 | tr -d ' ') (not the host disk)"
+    umount "$m" 2>/dev/null; rm -f "$img"; rmdir "$m" 2>/dev/null; return 0
   fi
-  ok "LXD ready"
+  err "Loop-mount FAILED: $err"
+  rm -f "$img"; rmdir "$m" 2>/dev/null
+  return 1
+}
+
+prepare_storage() {
+  info "Preparing separate-disk support (dedicated storage per shared VPS / account)"
+  local pair bin pkg
+  for pair in mkfs.ext4:e2fsprogs resize2fs:e2fsprogs losetup:util-linux mount:mount setquota:quota debootstrap:debootstrap systemd-nspawn:systemd-container proot:proot tmux:tmux; do
+    bin="${pair%%:*}"; pkg="${pair##*:}"
+    command -v "$bin" >/dev/null 2>&1 || quiet apt-get -o DPkg::Lock::Timeout=180 install -y "$pkg" || warn "package $pkg not installed (needed for $bin)"
+  done
+  # loop devices: load module now + on every boot, make sure the nodes exist
+  quiet modprobe loop
+  mkdir -p /etc/modules-load.d && echo loop > /etc/modules-load.d/jazz-loop.conf
+  [[ -e /dev/loop-control ]] || quiet mknod /dev/loop-control c 10 237
+  local i; for i in $(seq 0 31); do [[ -e /dev/loop$i ]] || quiet mknod /dev/loop$i b 7 $i; done
+  mkdir -p /opt/hvm-shared/disks /etc/hvm-shared
+  if ! loop_selftest; then
+    warn "This server cannot loop-mount disks, so each shared VPS would show the HOST disk in 'df -h'."
+    warn "Cause is usually a container/OpenVZ host without loop support or a kernel without the 'loop' module."
+    warn "Use a KVM/dedicated server (or enable loop/privileged mode at your provider), then run: jazz-panel fix-storage"
+    return 1
+  fi
+}
+
+do_fix_storage() {
+  need_root; : >> "$LOG_FILE"
+  prepare_storage || die "Storage support is not available on this server"
+  if [[ -x "$CLI_PATH" ]]; then "$CLI_PATH" restart >/dev/null 2>&1 && ok "Panel restarted (re-mounts existing account disks)"; fi
+  echo
+  ok "Done. NOTE: a shared VPS that was already created without its own disk must be re-created / reinstalled"
+  echo "       from the panel once - new ones get their own disk automatically (df -h shows only the assigned size)."
 }
 
 install_sshx() {
@@ -431,6 +515,8 @@ PYEND
   update)  bash "$INSTALL_DIR/jazz-installer.sh" --update ;;
   uninstall) bash "$INSTALL_DIR/jazz-installer.sh" --uninstall ;;
   menu)    bash "$INSTALL_DIR/jazz-installer.sh" --menu ;;
+  fix-lxd) bash "$INSTALL_DIR/jazz-installer.sh" --fix-lxd ;;
+  fix-storage) bash "$INSTALL_DIR/jazz-installer.sh" --fix-storage ;;
   *) cat <<H
 JAZZ VPS MANAGEMENT PANEL
 
@@ -443,6 +529,8 @@ JAZZ VPS MANAGEMENT PANEL
   jazz-panel admin        change admin username / email / password
   jazz-panel update       download the latest panel files from GitHub (data is kept)
   jazz-panel menu         open the manager menu
+  jazz-panel fix-lxd      repair LXD storage pool (error: Storage pool not found)
+  jazz-panel fix-storage  enable separate disk per VPS (df -h shows only the assigned size)
   jazz-panel uninstall    remove the panel
 
 Direct PM2 commands also work:
@@ -529,6 +617,7 @@ do_install() {
   fi
   setup_files
   setup_venv
+  prepare_storage || warn "Continuing - the panel works, but per-VPS disks need loop support (jazz-panel fix-storage)"
   if (( ! update )); then
     echo
     echo "${C}-------- Create the admin account --------${D}"
@@ -668,6 +757,8 @@ manager_menu() {
  6. View logs
  7. Change admin username / email / password
  8. Uninstall
+ 9. Fix LXD storage pool (VPS creation error)
+10. Fix separate disk per VPS (df -h shows host disk)
 
  0. Exit
 
@@ -683,6 +774,8 @@ M
       6) pm2_action logs ;;
       7) pm2_action admin ;;
       8) do_uninstall ;;
+      9) do_fix_lxd ;;
+      10) do_fix_storage ;;
       0) exit 0 ;;
       *) warn "Invalid option" ;;
     esac
@@ -733,11 +826,13 @@ main() {
   for a in "$@"; do
     case "$a" in
       --install) action=install ;; --uninstall) action=uninstall ;; --yes|-y) JAZZ_YES=1 ;;
-      --selftest) action=selftest ;; --update) action=install; JAZZ_YES=1 ;; --menu) action=menu ;; -h|--help) usage; exit 0 ;;
+      --selftest) action=selftest ;; --fix-lxd) action=fixlxd ;; --fix-storage) action=fixstorage ;; --update) action=install; JAZZ_YES=1 ;; --menu) action=menu ;; -h|--help) usage; exit 0 ;;
     esac
   done
   case "$action" in
     install)   do_install ;;
+    fixlxd)    do_fix_lxd ;;
+    fixstorage) do_fix_storage ;;
     uninstall) do_uninstall ;;
     selftest)  need_root; : > "$LOG_FILE"; _d="$(mktemp -d)"; fetch_panel "$_d" && echo "source OK: $(ls "$_d" | tr '\n' ' ')" ;;
     menu)      need_root; INSTALL_DIR="${INSTALL_DIR:-$(find_existing_install || true)}"; manager_menu ;;
