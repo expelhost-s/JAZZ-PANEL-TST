@@ -398,6 +398,32 @@ do_fix_lxd() {
   ok "Done. Try creating the VPS again in the panel (no restart needed)."
 }
 
+# ---------- identity shown inside shared VPS (hostname + kernel) ----------
+# Default = the MAIN VPS's own hostname and kernel (nothing is faked). Stored in /etc/hvm-shared/identity,
+# read by every shared VPS when it starts. Change later with:  jazz-panel identity
+write_identity() {  # write_identity <hostname> <kernel>
+  local h k; h="$(printf '%s' "$1" | tr -cd 'A-Za-z0-9._-')"; k="$(printf '%s' "$2" | tr -cd 'A-Za-z0-9._+~-')"
+  [[ -n "$h" ]] || h="$(hostname 2>/dev/null)"; [[ -n "$k" ]] || k="$(uname -r)"
+  mkdir -p /etc/hvm-shared
+  printf 'HOSTNAME=%s\nKERNEL=%s\n' "$h" "$k" > /etc/hvm-shared/identity && chmod 644 /etc/hvm-shared/identity
+  ok "Shared VPS will show hostname '$h' and kernel '$k'"
+}
+ask_identity() {
+  local dh dk h k
+  dh="$(hostname 2>/dev/null)"; dk="$(uname -r)"
+  echo
+  echo "${C}-------- Shared VPS hostname & kernel --------${D}"
+  echo " Press Enter to keep the MAIN VPS values (nothing is changed)."
+  h=$(ask "Hostname shown inside shared VPS" "$dh")
+  k=$(ask "Kernel shown inside shared VPS" "$dk")
+  write_identity "$h" "$k"
+}
+do_identity() {
+  need_root; mkdir -p /etc/hvm-shared
+  ask_identity
+  [[ -x "$CLI_PATH" ]] && ok "New shared VPS shells use it on next login (no restart needed)"
+}
+
 # ---------- per-VPS dedicated disk (shared hosting accounts get their own ext4 loop volume) ----------
 loop_diag() {   # print WHY loop-mounting is (not) possible - used when the self-test fails and by --doctor
   echo " loop diag     : proot=$IN_PROOT  CAP_SYS_ADMIN=$( ((HAS_SYS_ADMIN)) && echo yes || echo NO )  can-mount=$( ((CAN_MOUNT)) && echo yes || echo NO )"
@@ -674,6 +700,7 @@ PYEND
   menu)    bash "$INSTALL_DIR/jazz-installer.sh" --menu ;;
   fix-lxd) bash "$INSTALL_DIR/jazz-installer.sh" --fix-lxd ;;
   fix-storage) bash "$INSTALL_DIR/jazz-installer.sh" --fix-storage ;;
+  identity) bash "$INSTALL_DIR/jazz-installer.sh" --identity ;;
   doctor)  bash "$INSTALL_DIR/jazz-installer.sh" --doctor ;;
   *) cat <<H
 JAZZ VPS MANAGEMENT PANEL
@@ -689,6 +716,7 @@ JAZZ VPS MANAGEMENT PANEL
   jazz-panel menu         open the manager menu
   jazz-panel fix-lxd      repair LXD storage pool (error: Storage pool not found)
   jazz-panel fix-storage  enable separate disk per VPS (df -h shows only the assigned size)
+  jazz-panel identity     change hostname / kernel shown inside shared VPS
   jazz-panel doctor       diagnose problems (environment, network, logs)
   jazz-panel uninstall    remove the panel
 
@@ -798,6 +826,7 @@ do_install() {
     pass=$(ask_pw "Admin password" "admin")
     echo
   fi
+  if (( ! update )) || [[ ! -f /etc/hvm-shared/identity ]]; then ask_identity; fi
   write_env "${port:-3000}" "$user" "$pass" "${email:-admin@gmail.com}" "${name:-JAZZ VPS Management Panel}" "$ip" "$domain"
   write_ecosystem
   write_cli
@@ -957,6 +986,7 @@ manager_menu() {
  8. Uninstall
  9. Fix LXD storage pool (VPS creation error)
 10. Fix separate disk per VPS (df -h shows host disk)
+11. Change shared VPS hostname / kernel
 
  0. Exit
 
@@ -974,6 +1004,7 @@ M
       8) do_uninstall ;;
       9) do_fix_lxd ;;
       10) do_fix_storage ;;
+      11) do_identity ;;
       0) exit 0 ;;
       *) warn "Invalid option" ;;
     esac
@@ -1025,7 +1056,7 @@ main() {
   for a in "$@"; do
     case "$a" in
       --install) action=install ;; --uninstall) action=uninstall ;; --yes|-y) JAZZ_YES=1 ;;
-      --selftest) action=selftest ;; --fix-lxd) action=fixlxd ;; --fix-storage) action=fixstorage ;; --update) action=install; JAZZ_YES=1 ;; --menu) action=menu ;; --doctor) action=doctor ;; -h|--help) usage; exit 0 ;;
+      --selftest) action=selftest ;; --fix-lxd) action=fixlxd ;; --fix-storage) action=fixstorage ;; --identity) action=identity ;; --update) action=install; JAZZ_YES=1 ;; --menu) action=menu ;; --doctor) action=doctor ;; -h|--help) usage; exit 0 ;;
     esac
   done
   : >> "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/jazz-installer.log"   # /var/log not writable? use /tmp
@@ -1035,6 +1066,7 @@ main() {
     install)   do_install ;;
     fixlxd)    do_fix_lxd ;;
     fixstorage) do_fix_storage ;;
+    identity)  do_identity ;;
     uninstall) do_uninstall ;;
     selftest)  need_root; : > "$LOG_FILE"; _d="$(mktemp -d)"; fetch_panel "$_d" && echo "source OK: $(ls "$_d" | tr '\n' ' ')" ;;
     menu)      need_root; INSTALL_DIR="${INSTALL_DIR:-$(find_existing_install || true)}"; manager_menu ;;
