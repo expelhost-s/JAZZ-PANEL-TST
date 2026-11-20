@@ -137,7 +137,8 @@ fetch_panel() {  # fetch_panel <dest> : download latest panel files from GitHub 
 # ---------- install location ----------
 find_existing_install() {
   local d
-  for d in /root/jazz-vps-panel /opt/jazz-vps-panel /home/jazz-vps-panel; do
+  for d in "$INSTALL_DIR" /root/jazz-vps-panel /opt/jazz-vps-panel /home/jazz-vps-panel; do
+    [[ -n "$d" ]] || continue
     [[ -f "$d/.env" ]] && { echo "$d"; return 0; }
   done
   return 1
@@ -727,6 +728,7 @@ U
 }
 
 main() {
+  trap 'echo; echo " Bye. (The panel keeps running in PM2 - run: jazz-panel menu)"; exit 0' INT
   local action=""
   for a in "$@"; do
     case "$a" in
@@ -739,7 +741,9 @@ main() {
     uninstall) do_uninstall ;;
     selftest)  need_root; : > "$LOG_FILE"; _d="$(mktemp -d)"; fetch_panel "$_d" && echo "source OK: $(ls "$_d" | tr '\n' ' ')" ;;
     menu)      need_root; INSTALL_DIR="${INSTALL_DIR:-$(find_existing_install || true)}"; manager_menu ;;
-    "")        need_root; start_menu ;;
+    "")        need_root
+               # already installed -> full manager menu (start / stop / restart ...); fresh server -> install menu
+               if _ex="$(find_existing_install)"; then INSTALL_DIR="${INSTALL_DIR:-$_ex}"; manager_menu; else start_menu; fi ;;
   esac
 }
 
