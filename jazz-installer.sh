@@ -4,6 +4,9 @@
 #  Installs every dependency + every panel file, starts the panel in
 #  PM2 and gives you the jazz-panel command (start/stop/restart/...).
 #  Supported: Debian 11/12/13, Ubuntu 20.04/22.04/24.04 (run as root)
+#  Works on full servers AND on restricted/shared VPS (proot, no systemd, no snap,
+#  no mount rights): optional parts are skipped instead of failing the install.
+#  Problems?  bash jazz-installer.sh --doctor
 # =====================================================================
 set -uo pipefail
 
@@ -21,6 +24,50 @@ LOG_FILE="/var/log/jazz-installer.log"
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 export DEBIAN_FRONTEND=noninteractive
 export PATH="$PATH:/snap/bin:/usr/local/bin"
+export PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 PIP_ROOT_USER_ACTION=ignore PIP_BREAK_SYSTEM_PACKAGES=1
+export NPM_CONFIG_FUND=false NPM_CONFIG_AUDIT=false NPM_CONFIG_UPDATE_NOTIFIER=false
+
+# ---------- environment detection (real server vs. shared / proot / container VPS) ----------
+# "Restricted" = no systemd, a proot/ptrace fake-root sandbox, or no right to mount filesystems.
+# There snap/LXD, loop-mounted disks and systemd services cannot work. The panel itself runs fine,
+# so the installer switches to a compatibility mode instead of dying on those optional parts.
+# Override with JAZZ_RESTRICTED=1 (force) or JAZZ_RESTRICTED=0 (never).
+HAS_SYSTEMD=0; RESTRICTED=0; CAN_MOUNT=1; ENV_NOTES=""
+detect_env() {
+  local tracer d
+  [[ -d /run/systemd/system ]] && HAS_SYSTEMD=1
+  tracer="$(awk '/^TracerPid:/{print $2}' /proc/self/status 2>/dev/null)"
+  if (( ! HAS_SYSTEMD )); then RESTRICTED=1; ENV_NOTES+="no systemd; "; fi
+  if [[ -n "${tracer:-}" && "$tracer" != "0" ]] || [[ -n "${PROOT_TMP_DIR:-}${PROOT_L2S_DIR:-}" ]]; then
+    RESTRICTED=1; ENV_NOTES+="proot/ptrace sandbox; "
+  fi
+  if [[ $EUID -eq 0 ]]; then
+    d="$(mktemp -d 2>/dev/null || echo "/tmp/.jazz-probe.$$")"; mkdir -p "$d" 2>/dev/null
+    if mount -t tmpfs jazzprobe "$d" >/dev/null 2>&1; then umount "$d" >/dev/null 2>&1
+    else CAN_MOUNT=0; RESTRICTED=1; ENV_NOTES+="cannot mount filesystems; "; fi
+    rmdir "$d" 2>/dev/null
+  fi
+  [[ -n "${JAZZ_RESTRICTED:-}" ]] && RESTRICTED="$JAZZ_RESTRICTED"
+  return 0
+}
+
+# ---------- apt hardening (works on minimal images and inside proot) ----------
+APT_OPTS=(-o DPkg::Lock::Timeout=180 -o Acquire::Retries=3 -o APT::Sandbox::User=root
+          -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+apt-get() { command apt-get "${APT_OPTS[@]}" "$@"; }   # every apt-get call below gets these options
+apt_install() {   # install, and if dpkg is left half-configured repair it and retry once
+  apt-get install -y "$@" >> "$LOG_FILE" 2>&1 && return 0
+  quiet dpkg --configure -a --force-confdef --force-confold
+  quiet apt-get -f install -y
+  apt-get install -y "$@" >> "$LOG_FILE" 2>&1
+}
+POLICY_CREATED=0
+block_services() {   # no systemd -> stop package post-install scripts from trying to start daemons
+  [[ -e /usr/sbin/policy-rc.d ]] && return 0
+  { printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d && chmod 755 /usr/sbin/policy-rc.d && POLICY_CREATED=1; } 2>/dev/null
+  return 0
+}
+unblock_services() { (( POLICY_CREATED )) && rm -f /usr/sbin/policy-rc.d && POLICY_CREATED=0; return 0; }
 
 # ---------- colours ----------
 if [[ -t 1 ]]; then
@@ -31,7 +78,7 @@ ok()   { echo "${G}[ OK ]${D} $*"; }
 info() { echo "${C}[ .. ]${D} $*"; }
 warn() { echo "${Y}[WARN]${D} $*"; }
 err()  { echo "${R}[FAIL]${D} $*" >&2; }
-die()  { err "$*"; echo "       Full log: $LOG_FILE" >&2; exit 1; }
+die()  { err "$*"; echo "       Full log: $LOG_FILE" >&2; echo "       Diagnose: bash $(basename "$SELF") --doctor" >&2; unblock_services; exit 1; }
 
 banner() {
   clear 2>/dev/null || true
@@ -179,25 +226,41 @@ check_os() {
 }
 
 fix_hostname() {
-  # hvm.py calls socket.gethostbyname(socket.gethostname()) at import time - it
-  # crashes (and PM2 shows "errored") if the hostname does not resolve.
-  local h; h="$(hostname)"
-  if ! getent hosts "$h" >/dev/null 2>&1; then
-    echo "127.0.1.1 $h" >> /etc/hosts
-    ok "Added hostname '$h' to /etc/hosts"
+  # hvm.py calls socket.gethostbyname(socket.gethostname()) at import time - it crashes (PM2 shows
+  # "errored") if the hostname does not resolve. Fix /etc/hosts if we can; setup_venv also installs
+  # a Python-level fallback for servers where /etc/hosts cannot be changed (shared / proot).
+  local h; h="$(hostname 2>/dev/null)"; [[ -n "$h" ]] || h="$(cat /etc/hostname 2>/dev/null)"; [[ -n "$h" ]] || h=localhost
+  getent hosts "$h" >/dev/null 2>&1 && return 0
+  if { echo "127.0.1.1 $h" >> /etc/hosts; } 2>/dev/null && getent hosts "$h" >/dev/null 2>&1; then
+    ok "Added hostname '$h' to /etc/hosts"; return 0
   fi
+  warn "Hostname '$h' does not resolve and /etc/hosts cannot be changed - using the built-in fallback"
 }
 
 install_apt() {
-  run "Updating package lists" apt-get -o DPkg::Lock::Timeout=180 update -y || die "apt update failed"
-  run "Installing core packages" apt-get -o DPkg::Lock::Timeout=180 install -y \
-      -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
-      ca-certificates curl wget git tar gzip unzip rsync sqlite3 openssl gnupg \
-      build-essential python3 python3-dev python3-venv python3-pip libffi-dev libssl-dev \
-      iptables openssh-client e2fsprogs util-linux lsb-release \
-      || die "Core package install failed"
-  info "Installing optional tools (quota, tmate, snapd, uidmap)"
-  for p in quota tmate snapd uidmap; do quiet apt-get -o DPkg::Lock::Timeout=180 install -y "$p" || warn "optional package $p not installed"; done
+  (( RESTRICTED )) && block_services
+  quiet dpkg --configure -a --force-confdef --force-confold      # heal any half-finished earlier install
+  if ! run "Updating package lists" apt-get update -y; then
+    warn "apt update failed - retrying once"; sleep 3
+    run "Updating package lists (retry)" apt-get update -y || die "apt update failed"
+  fi
+  local core="ca-certificates curl wget git tar gzip unzip xz-utils rsync sqlite3 openssl gnupg build-essential python3 python3-dev python3-venv python3-pip libffi-dev libssl-dev"
+  local p
+  info "Installing core packages"
+  if ! apt_install $core; then
+    warn "Bulk install failed - installing the packages one by one"
+    tail -n 8 "$LOG_FILE" >&2
+    for p in $core; do apt_install "$p" || warn "package $p could not be installed"; done
+    for p in python3 python3-venv curl git unzip ca-certificates tar; do
+      dpkg -s "$p" >/dev/null 2>&1 || die "Essential package '$p' could not be installed"
+    done
+  fi
+  ok "Core packages ready"
+  local opt="iptables openssh-client e2fsprogs util-linux lsb-release"
+  (( RESTRICTED )) || opt+=" quota tmate snapd uidmap"     # snap/quota/uidmap need a real server
+  info "Installing optional tools ($opt)"
+  for p in $opt; do apt_install "$p" || warn "optional package $p not installed"; done
+  quiet dpkg --configure -a --force-confdef --force-confold
   ok "System packages ready"
 }
 
@@ -226,24 +289,51 @@ ensure_python() {
   ok "Python: $("$PYBIN" --version) ($PYBIN)"
 }
 
+node_major() {
+  hash -r 2>/dev/null
+  command -v node >/dev/null 2>&1 && node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0
+}
+
+install_node_tarball() {   # official binary - needs no apt/snap/systemd, so it works everywhere
+  local arch ver="v20.18.1" tmp
+  case "$(uname -m)" in x86_64) arch=x64 ;; aarch64) arch=arm64 ;; *) return 1 ;; esac
+  info "Installing Node.js $ver (official binary from nodejs.org)"
+  tmp="$(mktemp -d)"
+  if curl -fsSL --retry 3 --connect-timeout 20 "https://nodejs.org/dist/$ver/node-$ver-linux-$arch.tar.xz" -o "$tmp/node.tar.xz" >>"$LOG_FILE" 2>&1 \
+     && tar -xJf "$tmp/node.tar.xz" --exclude='CHANGELOG.md' --exclude='LICENSE' --exclude='README.md' -C /usr/local --strip-components=1 >>"$LOG_FILE" 2>&1; then
+    rm -rf "$tmp"; hash -r; return 0
+  fi
+  rm -rf "$tmp"; return 1
+}
+
 install_node_pm2() {
-  local major=0
-  command -v node >/dev/null 2>&1 && major=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)
+  local major; major=$(node_major)
   if (( major < 16 )); then
-    info "Installing Node.js 20 (NodeSource)"
-    if curl -fsSL https://deb.nodesource.com/setup_20.x -o /tmp/nodesource_setup.sh >>"$LOG_FILE" 2>&1 \
-       && quiet bash /tmp/nodesource_setup.sh && quiet apt-get install -y nodejs; then :
-    else
-      warn "NodeSource failed, falling back to distro nodejs/npm"
-      run "Installing nodejs + npm" apt-get install -y nodejs npm || die "Node.js install failed"
+    if (( ! RESTRICTED )); then
+      info "Installing Node.js 20 (NodeSource)"
+      if curl -fsSL https://deb.nodesource.com/setup_20.x -o /tmp/nodesource_setup.sh >>"$LOG_FILE" 2>&1 \
+         && quiet bash /tmp/nodesource_setup.sh && quiet apt-get install -y nodejs; then :
+      else warn "NodeSource failed"; fi
+      major=$(node_major)
+    fi
+    if (( major < 16 )); then install_node_tarball || warn "nodejs.org download failed"; major=$(node_major); fi
+    if (( major < 16 )); then
+      run "Installing nodejs + npm (distro packages)" apt-get install -y nodejs npm || die "Node.js install failed"
     fi
   fi
+  command -v node >/dev/null 2>&1 || die "Node.js is not available"
   ok "Node.js $(node -v)"
+  command -v npm >/dev/null 2>&1 || { quiet apt-get install -y npm; hash -r; }
+  command -v npm >/dev/null 2>&1 || die "npm is not available"
   if ! command -v pm2 >/dev/null 2>&1; then
-    run "Installing PM2" npm install -g pm2 || die "PM2 install failed"
+    run "Installing PM2" npm install -g pm2 \
+      || { warn "retrying PM2 install"; run "Installing PM2 (retry)" npm install -g pm2 || die "PM2 install failed"; }
+    hash -r
   fi
   ok "PM2 $(pm2 -v 2>/dev/null | tail -1)"
-  quiet pm2 install pm2-logrotate && quiet pm2 set pm2-logrotate:max_size 20M && quiet pm2 set pm2-logrotate:retain 7
+  if (( ! RESTRICTED )); then
+    quiet pm2 install pm2-logrotate && quiet pm2 set pm2-logrotate:max_size 20M && quiet pm2 set pm2-logrotate:retain 7
+  fi
 }
 
 # Make sure LXD has storage pool "default" (+ root disk on the default profile + lxdbr0 network).
@@ -281,6 +371,9 @@ ensure_lxd_pool() {
 }
 
 install_lxd() {
+  if (( RESTRICTED )) && [[ ${JAZZ_FORCE_LXD:-0} != 1 ]]; then
+    warn "LXD skipped: it needs snap + systemd, which this environment does not have (panel still works)"; return 1
+  fi
   if command -v lxc >/dev/null 2>&1 && quiet lxc info; then ok "LXD already installed and running"; ensure_lxd_pool; return $?; fi
   info "Installing LXD (container engine used to create VPS)"
   quiet systemctl enable --now snapd.socket snapd.service
@@ -318,6 +411,11 @@ loop_selftest() {  # create a 64MB image, mkfs, loop-mount it, read df, clean up
 }
 
 prepare_storage() {
+  if (( RESTRICTED )); then
+    info "Restricted environment - skipping per-VPS disk support (needs a real KVM/dedicated server)"
+    mkdir -p /opt/hvm-shared /etc/hvm-shared 2>/dev/null
+    return 0
+  fi
   info "Preparing separate-disk support (dedicated storage per shared VPS / account)"
   local pair bin pkg
   for pair in mkfs.ext4:e2fsprogs resize2fs:e2fsprogs losetup:util-linux mount:mount setquota:quota debootstrap:debootstrap systemd-nspawn:systemd-container proot:proot tmux:tmux; do
@@ -340,6 +438,7 @@ prepare_storage() {
 
 do_fix_storage() {
   need_root; : >> "$LOG_FILE"
+  (( RESTRICTED )) && die "This environment cannot loop-mount disks (${ENV_NOTES%; }). Per-VPS disks need a KVM/dedicated server."
   prepare_storage || die "Storage support is not available on this server"
   if [[ -x "$CLI_PATH" ]]; then "$CLI_PATH" restart >/dev/null 2>&1 && ok "Panel restarted (re-mounts existing account disks)"; fi
   echo
@@ -377,25 +476,59 @@ setup_files() {
   ok "Panel files installed in $INSTALL_DIR"
 }
 
+install_hostfix() {   # Python-level fallback for an unresolvable hostname (see fix_hostname)
+  local sp; sp="$(venv/bin/python -c 'import sysconfig;print(sysconfig.get_paths()["purelib"])' 2>/dev/null)"
+  [[ -d "$sp" ]] || return 0
+  cat > "$sp/jazz_hostfix.py" <<'PY'
+# hvm.py runs socket.gethostbyname(socket.gethostname()) when it is imported. If the hostname is not in
+# /etc/hosts (shared / proot / minimal images) that raises and the panel never starts. Fall back to 127.0.0.1.
+import socket as _s
+_orig = _s.gethostbyname
+def _gethostbyname(host):
+    try:
+        return _orig(host)
+    except OSError:
+        try:
+            if host == _s.gethostname():
+                return "127.0.0.1"
+        except Exception:
+            pass
+        raise
+_s.gethostbyname = _gethostbyname
+PY
+  echo "import jazz_hostfix" > "$sp/jazz_hostfix.pth"
+}
+
 setup_venv() {
   cd "$INSTALL_DIR" || die "cd failed"
   [[ -x venv/bin/python ]] && ! venv/bin/python -c 'import sys;sys.exit(0 if sys.version_info>=(3,10) else 1)' 2>/dev/null && rm -rf venv
-  [[ -x venv/bin/python ]] || run "Creating Python virtual environment" "$PYBIN" -m venv venv || die "venv creation failed"
-  quiet venv/bin/python -m pip install --upgrade pip setuptools wheel
-  grep -viE '^(pip|setuptools|wheel)==' requirements.txt > .requirements.install
+  if [[ ! -x venv/bin/python ]]; then
+    if ! run "Creating Python virtual environment" "$PYBIN" -m venv venv; then
+      warn "python -m venv failed - trying virtualenv instead"
+      rm -rf venv
+      run "Installing virtualenv" "$PYBIN" -m pip install virtualenv || die "venv creation failed"
+      run "Creating virtual environment (virtualenv)" "$PYBIN" -m virtualenv venv || die "venv creation failed"
+    fi
+  fi
+  local PIPF=(--prefer-binary --no-cache-dir --retries 5 --timeout 60)
+  quiet venv/bin/python -m pip install "${PIPF[@]}" --upgrade pip setuptools wheel
+  tr -d '\r' < requirements.txt | grep -viE '^(pip|setuptools|wheel)==' > .requirements.install
   info "Installing Python dependencies (this can take a few minutes)"
-  if venv/bin/python -m pip install -r .requirements.install >>"$LOG_FILE" 2>&1; then
+  if venv/bin/python -m pip install "${PIPF[@]}" -r .requirements.install >>"$LOG_FILE" 2>&1; then
     ok "Python dependencies installed (pinned versions)"
   else
     warn "Pinned versions failed on this Python - retrying with compatible versions"
     sed -E 's/==.*//' .requirements.install | grep -viE '^(colorama)$' > .requirements.loose
     # keep the versions the panel code was written against
     sed -i -E 's/^Flask$/Flask==2.3.3/; s/^Werkzeug$/Werkzeug==2.3.7/; s/^Flask-SocketIO$/Flask-SocketIO==5.3.6/; s/^python-socketio$/python-socketio==5.11.2/; s/^python-engineio$/python-engineio==4.9.0/; s/^Flask-Login$/Flask-Login==0.6.3/' .requirements.loose
-    run "Installing Python dependencies (fallback)" venv/bin/python -m pip install -r .requirements.loose || die "Python dependency install failed"
+    run "Installing Python dependencies (fallback)" venv/bin/python -m pip install "${PIPF[@]}" -r .requirements.loose || die "Python dependency install failed"
   fi
   rm -f .requirements.install .requirements.loose
-  venv/bin/python -c "import flask, flask_login, flask_socketio, flask_cors, paramiko, PIL, psutil, requests, bcrypt, simple_websocket" >>"$LOG_FILE" 2>&1 \
-    || die "Dependency self-check failed (see log)"
+  local chk
+  if ! chk=$(venv/bin/python -c "import flask, flask_login, flask_socketio, flask_cors, paramiko, PIL, psutil, requests, bcrypt, simple_websocket" 2>&1); then
+    echo "$chk" >> "$LOG_FILE"; err "$chk"; die "Dependency self-check failed (see log)"
+  fi
+  install_hostfix
   ok "Dependency self-check passed"
 }
 
@@ -517,6 +650,7 @@ PYEND
   menu)    bash "$INSTALL_DIR/jazz-installer.sh" --menu ;;
   fix-lxd) bash "$INSTALL_DIR/jazz-installer.sh" --fix-lxd ;;
   fix-storage) bash "$INSTALL_DIR/jazz-installer.sh" --fix-storage ;;
+  doctor)  bash "$INSTALL_DIR/jazz-installer.sh" --doctor ;;
   *) cat <<H
 JAZZ VPS MANAGEMENT PANEL
 
@@ -531,6 +665,7 @@ JAZZ VPS MANAGEMENT PANEL
   jazz-panel menu         open the manager menu
   jazz-panel fix-lxd      repair LXD storage pool (error: Storage pool not found)
   jazz-panel fix-storage  enable separate disk per VPS (df -h shows only the assigned size)
+  jazz-panel doctor       diagnose problems (environment, network, logs)
   jazz-panel uninstall    remove the panel
 
 Direct PM2 commands also work:
@@ -549,10 +684,14 @@ start_pm2() {
   quiet pm2 delete "$PM2_NAME"
   run "Starting panel in PM2" pm2 start ecosystem.config.js || die "pm2 start failed"
   quiet pm2 save
-  quiet pm2 startup systemd -u root --hp /root
-  quiet systemctl enable pm2-root
-  quiet pm2 save
-  ok "PM2 auto-start on boot enabled"
+  if (( HAS_SYSTEMD )); then
+    quiet pm2 startup systemd -u root --hp /root
+    quiet systemctl enable pm2-root
+    quiet pm2 save
+    ok "PM2 auto-start on boot enabled"
+  else
+    warn "No systemd here, so PM2 cannot auto-start after a reboot. Start it again with:  jazz-panel start"
+  fi
 }
 
 open_firewall() {
@@ -563,15 +702,18 @@ open_firewall() {
 }
 
 health_check() {
-  local port="$1" i code=""
-  info "Waiting for the panel to answer on port $port ..."
-  for i in $(seq 1 45); do
+  local port="$1" i code="" tries=45
+  (( RESTRICTED )) && tries=120          # proot / shared environments start much slower
+  info "Waiting for the panel to answer on port $port (up to $((tries * 2))s) ..."
+  for i in $(seq 1 "$tries"); do
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$port/" || true)
     if [[ "$code" =~ ^(200|301|302|401|403)$ ]] && pm2_online; then ok "Panel is ONLINE (HTTP $code)"; return 0; fi
     sleep 2
   done
-  err "Panel did not come up. Last error log lines:"
-  tail -n 40 "$INSTALL_DIR/logs/panel-error.log" 2>/dev/null >&2
+  err "Panel did not come up."
+  pm2 describe "$PM2_NAME" 2>/dev/null | grep -E "status|restarts|exec cwd" >&2
+  echo "--- panel-error.log (last 40) ---" >&2; tail -n 40 "$INSTALL_DIR/logs/panel-error.log" 2>/dev/null >&2
+  echo "--- panel-out.log (last 25) ---" >&2;   tail -n 25 "$INSTALL_DIR/logs/panel-out.log" 2>/dev/null >&2
   return 1
 }
 
@@ -581,6 +723,7 @@ do_install() {
   : > "$LOG_FILE"
   banner
   check_os
+  (( RESTRICTED )) && warn "Restricted environment detected (${ENV_NOTES%; }) - compatibility mode"
 
   choose_location
   ok "Install folder: $INSTALL_DIR"
@@ -600,7 +743,10 @@ do_install() {
     domain="${domain#http://}"; domain="${domain#https://}"; domain="${domain%%/*}"
   fi
   local want_lxd=1
-  if (( ! update )) && ! command -v lxc >/dev/null 2>&1; then
+  if (( RESTRICTED )) && [[ ${JAZZ_FORCE_LXD:-0} != 1 ]]; then
+    want_lxd=0
+    info "LXD, snap, loop disks and systemd services are skipped here (not possible in this environment) - the panel itself works"
+  elif (( ! update )) && ! command -v lxc >/dev/null 2>&1; then
     yesno "Install LXD (required to create VPS containers)?" "y" || want_lxd=0
   fi
 
@@ -618,6 +764,7 @@ do_install() {
   setup_files
   setup_venv
   prepare_storage || warn "Continuing - the panel works, but per-VPS disks need loop support (jazz-panel fix-storage)"
+  unblock_services
   if (( ! update )); then
     echo
     echo "${C}-------- Create the admin account --------${D}"
@@ -657,6 +804,32 @@ do_install() {
   echo "    pm2 logs $PM2_NAME"
   echo
   pm2 list
+}
+
+do_doctor() {
+  need_root; : >> "$LOG_FILE" 2>/dev/null
+  echo "${W}JAZZ installer - diagnostics${D}"
+  local u c d h; h="$(hostname 2>/dev/null)"
+  [[ -r /etc/os-release ]] && . /etc/os-release
+  echo " OS            : ${PRETTY_NAME:-unknown} ($(uname -m), kernel $(uname -r))"
+  echo " user / host   : $(id -un) / ${h:-?}   (hostname resolves: $(getent hosts "${h:-localhost}" >/dev/null 2>&1 && echo yes || echo NO))"
+  echo " systemd       : $( ((HAS_SYSTEMD)) && echo yes || echo NO )"
+  echo " can mount     : $( ((CAN_MOUNT)) && echo yes || echo NO )"
+  echo " install mode  : $( ((RESTRICTED)) && echo "RESTRICTED (${ENV_NOTES%; }) -> compatibility mode" || echo "full server" )"
+  echo " resources     : $(free -m 2>/dev/null | awk '/Mem:/{print $2" MB RAM"}'), $(df -h / 2>/dev/null | awk 'NR==2{print $4" free on /"}')"
+  for u in https://github.com https://pypi.org https://files.pythonhosted.org https://nodejs.org https://registry.npmjs.org; do
+    c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$u" 2>/dev/null || true)
+    echo " network       : $u -> ${c:-no answer}"
+  done
+  echo " versions      : $(python3 --version 2>&1 | head -n1) | node $(command -v node >/dev/null 2>&1 && node -v || echo missing) | pm2 $(command -v pm2 >/dev/null 2>&1 && pm2 -v 2>&1 | tail -1 || echo missing)"
+  echo " dpkg state    : $(dpkg --audit 2>/dev/null | head -n 1 | grep -q . && echo "BROKEN (run: dpkg --configure -a)" || echo ok)"
+  d="$(find_existing_install || true)"
+  if [[ -n "$d" ]]; then
+    echo " panel folder  : $d"
+    pm2 describe "$PM2_NAME" 2>/dev/null | grep -E "status|restarts" | sed 's/^/ pm2           : /'
+    echo "--- $d/logs/panel-error.log (last 25) ---"; tail -n 25 "$d/logs/panel-error.log" 2>/dev/null
+  fi
+  echo "--- $LOG_FILE (last 30) ---"; tail -n 30 "$LOG_FILE" 2>/dev/null
 }
 
 do_uninstall() {
@@ -816,7 +989,8 @@ $APP_TITLE installer
   bash $(basename "$SELF") --install     install / update (asks questions)
   bash $(basename "$SELF") --install --yes   unattended (defaults, random admin password)
   bash $(basename "$SELF") --uninstall   remove
-Env overrides (with --yes): JAZZ_INSTALL_DIR
+  bash $(basename "$SELF") --doctor      diagnose a failing install
+Env overrides: JAZZ_INSTALL_DIR, JAZZ_RESTRICTED=1|0 (force/disable compatibility mode), JAZZ_FORCE_LXD=1
 U
 }
 
@@ -826,10 +1000,13 @@ main() {
   for a in "$@"; do
     case "$a" in
       --install) action=install ;; --uninstall) action=uninstall ;; --yes|-y) JAZZ_YES=1 ;;
-      --selftest) action=selftest ;; --fix-lxd) action=fixlxd ;; --fix-storage) action=fixstorage ;; --update) action=install; JAZZ_YES=1 ;; --menu) action=menu ;; -h|--help) usage; exit 0 ;;
+      --selftest) action=selftest ;; --fix-lxd) action=fixlxd ;; --fix-storage) action=fixstorage ;; --update) action=install; JAZZ_YES=1 ;; --menu) action=menu ;; --doctor) action=doctor ;; -h|--help) usage; exit 0 ;;
     esac
   done
+  : >> "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/jazz-installer.log"   # /var/log not writable? use /tmp
+  detect_env
   case "$action" in
+    doctor)    do_doctor ;;
     install)   do_install ;;
     fixlxd)    do_fix_lxd ;;
     fixstorage) do_fix_storage ;;
