@@ -398,30 +398,37 @@ do_fix_lxd() {
   ok "Done. Try creating the VPS again in the panel (no restart needed)."
 }
 
-# ---------- identity shown inside shared VPS (hostname + kernel) ----------
-# Default = the MAIN VPS's own hostname and kernel (nothing is faked). Stored in /etc/hvm-shared/identity,
-# read by every shared VPS when it starts. Change later with:  jazz-panel identity
-write_identity() {  # write_identity <hostname> <kernel>
-  local h k; h="$(printf '%s' "$1" | tr -cd 'A-Za-z0-9._-')"; k="$(printf '%s' "$2" | tr -cd 'A-Za-z0-9._+~-')"
-  [[ -n "$h" ]] || h="$(hostname 2>/dev/null)"; [[ -n "$k" ]] || k="$(uname -r)"
+# ---------- identity shown inside shared VPS ("Host:" line of neofetch + kernel) ----------
+# Default = the MAIN VPS's own Host name and kernel (nothing is faked). The VPS hostname is NOT asked:
+# it is generated automatically per VPS. Stored in /etc/hvm-shared/identity (read when a shared VPS starts).
+# Change later with:  jazz-panel identity
+main_host() {  # what neofetch prints as "Host:" on this (main) VPS
+  local d=/sys/devices/virtual/dmi/id h
+  h="$(echo "$(cat $d/product_name 2>/dev/null) $(cat $d/product_version 2>/dev/null)" | xargs 2>/dev/null)"
+  [[ -n "$h" ]] || h="$(hostname 2>/dev/null)"
+  echo "$h"
+}
+write_identity() {  # write_identity <host> <kernel>
+  local h k; h="$(printf '%s' "$1" | tr -cd 'A-Za-z0-9 ._()+-')"; k="$(printf '%s' "$2" | tr -cd 'A-Za-z0-9._+~-')"
+  [[ -n "$h" ]] || h="$(main_host)"; [[ -n "$k" ]] || k="$(uname -r)"
   mkdir -p /etc/hvm-shared
-  printf 'HOSTNAME=%s\nKERNEL=%s\n' "$h" "$k" > /etc/hvm-shared/identity && chmod 644 /etc/hvm-shared/identity
-  ok "Shared VPS will show hostname '$h' and kernel '$k'"
+  printf 'HOST=%s\nKERNEL=%s\n' "$h" "$k" > /etc/hvm-shared/identity && chmod 644 /etc/hvm-shared/identity
+  ok "Shared VPS will show Host '$h' and kernel '$k'"
 }
 ask_identity() {
   local dh dk h k
-  dh="$(hostname 2>/dev/null)"; dk="$(uname -r)"
+  dh="$(main_host)"; dk="$(uname -r)"
   echo
-  echo "${C}-------- Shared VPS hostname & kernel --------${D}"
+  echo "${C}-------- Shared VPS Host & kernel (neofetch) --------${D}"
   echo " Press Enter to keep the MAIN VPS values (nothing is changed)."
-  h=$(ask "Hostname shown inside shared VPS" "$dh")
+  h=$(ask "Host shown inside shared VPS" "$dh")
   k=$(ask "Kernel shown inside shared VPS" "$dk")
   write_identity "$h" "$k"
 }
 do_identity() {
   need_root; mkdir -p /etc/hvm-shared
   ask_identity
-  [[ -x "$CLI_PATH" ]] && ok "New shared VPS shells use it on next login (no restart needed)"
+  ok "Shared VPS pick it up the next time they are opened (no restart needed)"
 }
 
 # ---------- per-VPS dedicated disk (shared hosting accounts get their own ext4 loop volume) ----------
@@ -716,7 +723,7 @@ JAZZ VPS MANAGEMENT PANEL
   jazz-panel menu         open the manager menu
   jazz-panel fix-lxd      repair LXD storage pool (error: Storage pool not found)
   jazz-panel fix-storage  enable separate disk per VPS (df -h shows only the assigned size)
-  jazz-panel identity     change hostname / kernel shown inside shared VPS
+  jazz-panel identity     change Host / kernel shown inside shared VPS
   jazz-panel doctor       diagnose problems (environment, network, logs)
   jazz-panel uninstall    remove the panel
 
@@ -986,7 +993,7 @@ manager_menu() {
  8. Uninstall
  9. Fix LXD storage pool (VPS creation error)
 10. Fix separate disk per VPS (df -h shows host disk)
-11. Change shared VPS hostname / kernel
+11. Change shared VPS Host / kernel
 
  0. Exit
 
