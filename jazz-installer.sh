@@ -32,15 +32,18 @@ export NPM_CONFIG_FUND=false NPM_CONFIG_AUDIT=false NPM_CONFIG_UPDATE_NOTIFIER=f
 # There snap/LXD, loop-mounted disks and systemd services cannot work. The panel itself runs fine,
 # so the installer switches to a compatibility mode instead of dying on those optional parts.
 # Override with JAZZ_RESTRICTED=1 (force) or JAZZ_RESTRICTED=0 (never).
-HAS_SYSTEMD=0; RESTRICTED=0; CAN_MOUNT=1; ENV_NOTES=""
+HAS_SYSTEMD=0; RESTRICTED=0; CAN_MOUNT=1; IN_PROOT=0; HAS_SYS_ADMIN=1; ENV_NOTES=""
 detect_env() {
   local tracer d
   [[ -d /run/systemd/system ]] && HAS_SYSTEMD=1
   tracer="$(awk '/^TracerPid:/{print $2}' /proc/self/status 2>/dev/null)"
   if (( ! HAS_SYSTEMD )); then RESTRICTED=1; ENV_NOTES+="no systemd; "; fi
   if [[ -n "${tracer:-}" && "$tracer" != "0" ]] || [[ -n "${PROOT_TMP_DIR:-}${PROOT_L2S_DIR:-}" ]]; then
-    RESTRICTED=1; ENV_NOTES+="proot/ptrace sandbox; "
+    RESTRICTED=1; IN_PROOT=1; ENV_NOTES+="proot/ptrace sandbox; "
   fi
+  # CAP_SYS_ADMIN (bit 21) is what loop-mounting a per-VPS disk needs
+  local cap; cap="$(awk '/^CapEff:/{print $2}' /proc/self/status 2>/dev/null)"
+  if [[ -n "${cap:-}" ]] && (( ! (0x$cap >> 21 & 1) )); then HAS_SYS_ADMIN=0; fi
   if [[ $EUID -eq 0 ]]; then
     d="$(mktemp -d 2>/dev/null || echo "/tmp/.jazz-probe.$$")"; mkdir -p "$d" 2>/dev/null
     if mount -t tmpfs jazzprobe "$d" >/dev/null 2>&1; then umount "$d" >/dev/null 2>&1
@@ -396,49 +399,70 @@ do_fix_lxd() {
 }
 
 # ---------- per-VPS dedicated disk (shared hosting accounts get their own ext4 loop volume) ----------
+loop_diag() {   # print WHY loop-mounting is (not) possible - used when the self-test fails and by --doctor
+  echo " loop diag     : proot=$IN_PROOT  CAP_SYS_ADMIN=$( ((HAS_SYS_ADMIN)) && echo yes || echo NO )  can-mount=$( ((CAN_MOUNT)) && echo yes || echo NO )"
+  echo " loop diag     : /dev/loop-control $([[ -e /dev/loop-control ]] && echo present || echo MISSING), loop nodes: $(ls /dev/loop[0-9]* 2>/dev/null | wc -l)"
+  echo " loop diag     : kernel loop support: $(grep -qw loop /proc/devices 2>/dev/null && echo yes || echo 'NO (not in /proc/devices)')"
+}
+
 loop_selftest() {  # create a 64MB image, mkfs, loop-mount it, read df, clean up. Prints the real error on failure.
-  local d=/opt/hvm-shared/disks img m err
+  local d=/opt/hvm-shared/disks img m err ld
   mkdir -p "$d"; img="$d/.selftest.img"; m="$(mktemp -d)"
   rm -f "$img"; truncate -s 64M "$img" 2>/dev/null || { err "Not enough disk space to create a test image"; return 1; }
+  command -v mkfs.ext4 >/dev/null 2>&1 || { err "mkfs.ext4 is missing (apt install e2fsprogs)"; rm -f "$img"; return 1; }
   mkfs.ext4 -F -q "$img" >>"$LOG_FILE" 2>&1 || { err "mkfs.ext4 failed"; rm -f "$img"; return 1; }
   if err=$(mount -o loop,noatime "$img" "$m" 2>&1); then
     ok "Loop-mount test passed: a 64MB volume shows as $(df -h --output=size "$m" | tail -1 | tr -d ' ') (not the host disk)"
     umount "$m" 2>/dev/null; rm -f "$img"; rmdir "$m" 2>/dev/null; return 0
   fi
+  # second try: attach the loop device by hand, then mount it (works where 'mount -o loop' cannot find a free device)
+  if ld=$(losetup -f --show "$img" 2>>"$LOG_FILE") && mount -o noatime "$ld" "$m" >>"$LOG_FILE" 2>&1; then
+    ok "Loop-mount test passed via losetup ($ld): 64MB volume shows as $(df -h --output=size "$m" | tail -1 | tr -d ' ')"
+    umount "$m" 2>/dev/null; losetup -d "$ld" 2>/dev/null; rm -f "$img"; rmdir "$m" 2>/dev/null; return 0
+  fi
+  [[ -n "${ld:-}" ]] && losetup -d "$ld" 2>/dev/null
   err "Loop-mount FAILED: $err"
+  loop_diag >&2
   rm -f "$img"; rmdir "$m" 2>/dev/null
   return 1
 }
 
 prepare_storage() {
-  if (( RESTRICTED )); then
-    info "Restricted environment - skipping per-VPS disk support (needs a real KVM/dedicated server)"
-    mkdir -p /opt/hvm-shared /etc/hvm-shared 2>/dev/null
-    return 0
-  fi
+  # Per-VPS dedicated disks (shared accounts) are ext4 images mounted through /dev/loop*. That needs real root,
+  # CAP_SYS_ADMIN and loop devices - NOT systemd. So we no longer skip this in "restricted" mode: we install the
+  # tools, create the loop nodes and TEST a real loop mount. Only the test result decides.
   info "Preparing separate-disk support (dedicated storage per shared VPS / account)"
+  (( RESTRICTED )) && block_services
   local pair bin pkg
   for pair in mkfs.ext4:e2fsprogs resize2fs:e2fsprogs losetup:util-linux mount:mount setquota:quota debootstrap:debootstrap systemd-nspawn:systemd-container proot:proot tmux:tmux; do
     bin="${pair%%:*}"; pkg="${pair##*:}"
-    command -v "$bin" >/dev/null 2>&1 || quiet apt-get -o DPkg::Lock::Timeout=180 install -y "$pkg" || warn "package $pkg not installed (needed for $bin)"
+    command -v "$bin" >/dev/null 2>&1 || apt_install "$pkg" || warn "package $pkg not installed (needed for $bin)"
   done
   # loop devices: load module now + on every boot, make sure the nodes exist
   quiet modprobe loop
-  mkdir -p /etc/modules-load.d && echo loop > /etc/modules-load.d/jazz-loop.conf
+  mkdir -p /etc/modules-load.d 2>/dev/null && echo loop > /etc/modules-load.d/jazz-loop.conf 2>/dev/null
   [[ -e /dev/loop-control ]] || quiet mknod /dev/loop-control c 10 237
-  local i; for i in $(seq 0 31); do [[ -e /dev/loop$i ]] || quiet mknod /dev/loop$i b 7 $i; done
+  local i; for i in $(seq 0 63); do [[ -e /dev/loop$i ]] || quiet mknod /dev/loop$i b 7 $i; done
   mkdir -p /opt/hvm-shared/disks /etc/hvm-shared
   if ! loop_selftest; then
     warn "This server cannot loop-mount disks, so each shared VPS would show the HOST disk in 'df -h'."
-    warn "Cause is usually a container/OpenVZ host without loop support or a kernel without the 'loop' module."
-    warn "Use a KVM/dedicated server (or enable loop/privileged mode at your provider), then run: jazz-panel fix-storage"
+    if (( IN_PROOT )); then
+      warn "Cause: the installer runs inside proot/ptrace, which can never mount filesystems. Run it on the real host (not inside proot)."
+    elif (( ! HAS_SYS_ADMIN )); then
+      warn "Cause: no CAP_SYS_ADMIN. In Docker start the container with --privileged (or --cap-add SYS_ADMIN --device /dev/loop-control)."
+    else
+      warn "Cause is usually a container/OpenVZ host without loop support or a kernel without the 'loop' module."
+    fi
+    warn "Fix the cause (KVM/dedicated server or privileged container), then run: jazz-panel fix-storage"
+    (( RESTRICTED )) && unblock_services
     return 1
   fi
+  (( RESTRICTED )) && unblock_services
+  return 0
 }
 
 do_fix_storage() {
   need_root; : >> "$LOG_FILE"
-  (( RESTRICTED )) && die "This environment cannot loop-mount disks (${ENV_NOTES%; }). Per-VPS disks need a KVM/dedicated server."
   prepare_storage || die "Storage support is not available on this server"
   if [[ -x "$CLI_PATH" ]]; then "$CLI_PATH" restart >/dev/null 2>&1 && ok "Panel restarted (re-mounts existing account disks)"; fi
   echo
@@ -745,7 +769,7 @@ do_install() {
   local want_lxd=1
   if (( RESTRICTED )) && [[ ${JAZZ_FORCE_LXD:-0} != 1 ]]; then
     want_lxd=0
-    info "LXD, snap, loop disks and systemd services are skipped here (not possible in this environment) - the panel itself works"
+    info "LXD / snap / systemd services are skipped here (no systemd). Per-VPS loop disks for shared VPS are still set up and tested."
   elif (( ! update )) && ! command -v lxc >/dev/null 2>&1; then
     yesno "Install LXD (required to create VPS containers)?" "y" || want_lxd=0
   fi
@@ -821,6 +845,7 @@ do_doctor() {
     c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$u" 2>/dev/null || true)
     echo " network       : $u -> ${c:-no answer}"
   done
+  loop_diag
   echo " versions      : $(python3 --version 2>&1 | head -n1) | node $(command -v node >/dev/null 2>&1 && node -v || echo missing) | pm2 $(command -v pm2 >/dev/null 2>&1 && pm2 -v 2>&1 | tail -1 || echo missing)"
   echo " dpkg state    : $(dpkg --audit 2>/dev/null | head -n 1 | grep -q . && echo "BROKEN (run: dpkg --configure -a)" || echo ok)"
   d="$(find_existing_install || true)"
