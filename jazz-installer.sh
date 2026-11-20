@@ -263,7 +263,7 @@ fetch_panel() {  # fetch_panel <dest> : download latest panel files from GitHub 
   else
     if task "Downloading panel from GitHub ($JAZZ_REPO)" env GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "$JAZZ_BRANCH" "https://github.com/$JAZZ_REPO.git" "$w/repo"; then
       if [[ -f "$w/repo/$JAZZ_ZIP" ]]; then zip="$w/repo/$JAZZ_ZIP"
-      elif [[ -f "$w/repo/hvm.py" ]]; then root="$w/repo"
+      elif [[ -f "$w/repo/jazz.py" ]]; then root="$w/repo"
       else zip="$(find "$w/repo" -maxdepth 2 -iname '*.zip' | head -1)"; fi
     else
       warn "git clone failed - trying direct download"
@@ -273,13 +273,13 @@ fetch_panel() {  # fetch_panel <dest> : download latest panel files from GitHub 
   if [[ -z "${root:-}" ]]; then
     [[ -n "$zip" && -f "$zip" ]] || die "Panel zip '$JAZZ_ZIP' not found in github.com/$JAZZ_REPO ($JAZZ_BRANCH). Is the repo public and the file uploaded?"
     mkdir -p "$w/x"; unzip -q -o "$zip" -d "$w/x" >>"$LOG_FILE" 2>&1 || die "Could not unzip the panel zip (damaged file?)"
-    root="$(dirname "$(find "$w/x" -name hvm.py -not -path '*/__MACOSX/*' | head -1)")"
+    root="$(dirname "$(find "$w/x" -name jazz.py -not -path '*/__MACOSX/*' | head -1)")"
   fi
-  [[ -f "$root/hvm.py" ]] || die "hvm.py not found inside the panel zip"
+  [[ -f "$root/jazz.py" ]] || die "jazz.py not found inside the panel zip"
   [[ -f "$root/requirements.txt" ]] || die "requirements.txt not found inside the panel zip"
   mkdir -p "$dest"
   [[ -f "$w/repo/jazz-installer.sh" ]] && grep -q "^fetch_panel()" "$w/repo/jazz-installer.sh" && cp -f "$w/repo/jazz-installer.sh" "$dest/jazz-installer.sh"
-  ( cd "$root" && tar cf - --exclude='.git' --exclude='__pycache__' --exclude='.trashed-*' --exclude='*.pyc' --exclude='hvm.db' . ) | tar xf - -C "$dest"
+  ( cd "$root" && tar cf - --exclude='.git' --exclude='__pycache__' --exclude='.trashed-*' --exclude='*.pyc' --exclude='jazz.db' . ) | tar xf - -C "$dest"
   rm -rf "$w"
   ok "Panel files unpacked"
 }
@@ -329,7 +329,7 @@ check_os() {
 }
 
 fix_hostname() {
-  # hvm.py calls socket.gethostbyname(socket.gethostname()) at import time - it crashes (PM2 shows
+  # jazz.py calls socket.gethostbyname(socket.gethostname()) at import time - it crashes (PM2 shows
   # "errored") if the hostname does not resolve. Fix /etc/hosts if we can; setup_venv also installs
   # a Python-level fallback for servers where /etc/hosts cannot be changed (shared / proot).
   local h; h="$(hostname 2>/dev/null)"; [[ -n "$h" ]] || h="$(cat /etc/hostname 2>/dev/null)"; [[ -n "$h" ]] || h=localhost
@@ -495,7 +495,7 @@ do_fix_lxd() {
 
 # ---------- identity shown inside shared VPS ("Host:" line of neofetch + kernel) ----------
 # Default = the MAIN VPS's own Host name and kernel (nothing is faked). The VPS hostname is NOT asked:
-# it is generated automatically per VPS. Stored in /etc/hvm-shared/identity (read when a shared VPS starts).
+# it is generated automatically per VPS. Stored in /etc/jazz-shared/identity (read when a shared VPS starts).
 # Change later with:  jazz-panel identity
 main_host() {  # what neofetch prints as "Host:" on this (main) VPS
   local d=/sys/devices/virtual/dmi/id h
@@ -506,8 +506,8 @@ main_host() {  # what neofetch prints as "Host:" on this (main) VPS
 write_identity() {  # write_identity <host> <kernel>
   local h k; h="$(printf '%s' "$1" | tr -cd 'A-Za-z0-9 ._()+-')"; k="$(printf '%s' "$2" | tr -cd 'A-Za-z0-9._+~-')"
   [[ -n "$h" ]] || h="$(main_host)"; [[ -n "$k" ]] || k="$(uname -r)"
-  mkdir -p /etc/hvm-shared
-  printf 'HOST=%s\nKERNEL=%s\n' "$h" "$k" > /etc/hvm-shared/identity && chmod 644 /etc/hvm-shared/identity
+  mkdir -p /etc/jazz-shared
+  printf 'HOST=%s\nKERNEL=%s\n' "$h" "$k" > /etc/jazz-shared/identity && chmod 644 /etc/jazz-shared/identity
   ok "Shared VPS will show Host '$h' and kernel '$k'"
 }
 ask_identity() {
@@ -520,7 +520,7 @@ ask_identity() {
   write_identity "$h" "$k"
 }
 do_identity() {
-  need_root; mkdir -p /etc/hvm-shared
+  need_root; mkdir -p /etc/jazz-shared
   ask_identity
   ok "Shared VPS pick it up the next time they are opened (no restart needed)"
 }
@@ -533,7 +533,7 @@ loop_diag() {   # print WHY loop-mounting is (not) possible - used when the self
 }
 
 loop_selftest() {  # create a 64MB image, mkfs, loop-mount it, read df, clean up. Prints the real error on failure.
-  local d=/opt/hvm-shared/disks img m err ld
+  local d=/opt/jazz-shared/disks img m err ld
   mkdir -p "$d"; img="$d/.selftest.img"; m="$(mktemp -d)"
   rm -f "$img"; truncate -s 64M "$img" 2>/dev/null || { err "Not enough disk space to create a test image"; return 1; }
   command -v mkfs.ext4 >/dev/null 2>&1 || { err "mkfs.ext4 is missing (apt install e2fsprogs)"; rm -f "$img"; return 1; }
@@ -570,7 +570,7 @@ prepare_storage() {
   mkdir -p /etc/modules-load.d 2>/dev/null && echo loop > /etc/modules-load.d/jazz-loop.conf 2>/dev/null
   [[ -e /dev/loop-control ]] || quiet mknod /dev/loop-control c 10 237
   local i; for i in $(seq 0 63); do [[ -e /dev/loop$i ]] || quiet mknod /dev/loop$i b 7 $i; done
-  mkdir -p /opt/hvm-shared/disks /etc/hvm-shared
+  mkdir -p /opt/jazz-shared/disks /etc/jazz-shared
   if ! loop_selftest; then
     warn "This server cannot loop-mount disks, so each shared VPS would show the HOST disk in 'df -h'."
     if (( IN_PROOT )); then
@@ -608,9 +608,9 @@ setup_files() {
   local tmp; tmp="$(mktemp -d)"
   fetch_panel "$tmp"
   mkdir -p "$INSTALL_DIR"
-  if [[ -f "$INSTALL_DIR/hvm.db" ]]; then
+  if [[ -f "$INSTALL_DIR/jazz.db" ]]; then
     mkdir -p "$INSTALL_DIR/backups"
-    cp -a "$INSTALL_DIR/hvm.db" "$INSTALL_DIR/backups/hvm.db.pre-update.$(date +%Y%m%d-%H%M%S)"
+    cp -a "$INSTALL_DIR/jazz.db" "$INSTALL_DIR/backups/jazz.db.pre-update.$(date +%Y%m%d-%H%M%S)"
     ok "Existing database backed up (update mode - data kept)"
   fi
   ( cd "$tmp" && tar cf - --exclude='./static/uploads' . ) | tar xf - -C "$INSTALL_DIR" || die "File copy failed"
@@ -631,7 +631,7 @@ install_hostfix() {   # Python-level fallback for an unresolvable hostname (see 
   local sp; sp="$(venv/bin/python -c 'import sysconfig;print(sysconfig.get_paths()["purelib"])' 2>/dev/null)"
   [[ -d "$sp" ]] || return 0
   cat > "$sp/jazz_hostfix.py" <<'PY'
-# hvm.py runs socket.gethostbyname(socket.gethostname()) when it is imported. If the hostname is not in
+# jazz.py runs socket.gethostbyname(socket.gethostname()) when it is imported. If the hostname is not in
 # /etc/hosts (shared / proot / minimal images) that raises and the panel never starts. Fall back to 127.0.0.1.
 import socket as _s
 _orig = _s.gethostbyname
@@ -696,7 +696,7 @@ PANEL_DEVELOPER=JAZZ
 HOST=0.0.0.0
 PORT=$port
 SECRET_KEY=$secret
-DATABASE_PATH=$INSTALL_DIR/hvm.db
+DATABASE_PATH=$INSTALL_DIR/jazz.db
 MAIN_ADMIN_USERNAME=$user
 MAIN_ADMIN_PASSWORD=$pass
 MAIN_ADMIN_EMAIL=$email
@@ -734,7 +734,7 @@ try {
 module.exports = {
   apps: [{
     name: 'jazz-panel',
-    script: 'hvm.py',
+    script: 'jazz.py',
     cwd: __dirname,
     interpreter: path.join(__dirname, 'venv', 'bin', 'python'),
     autorestart: true,
@@ -950,7 +950,7 @@ do_install() {
     email=$(ask "Admin email" "admin@gmail.com")
     pass=$(ask_pw "Admin password" "admin")
   fi
-  if (( ! update )) || [[ ! -f /etc/hvm-shared/identity ]]; then ask_identity; fi
+  if (( ! update )) || [[ ! -f /etc/jazz-shared/identity ]]; then ask_identity; fi
   write_env "${port:-3000}" "$user" "$pass" "${email:-admin@gmail.com}" "${name:-JAZZ VPS Management Panel}" "$ip" "$domain"
   write_ecosystem
   write_cli
@@ -1015,7 +1015,7 @@ do_doctor() {
 
 backup_panel_data() {   # backup_panel_data <dir>
   local bk="$1"; mkdir -p "$bk"
-  [[ -f "$INSTALL_DIR/hvm.db" ]] && cp -a "$INSTALL_DIR/hvm.db" "$bk/"
+  [[ -f "$INSTALL_DIR/jazz.db" ]] && cp -a "$INSTALL_DIR/jazz.db" "$bk/"
   [[ -f "$INSTALL_DIR/.env" ]] && cp -a "$INSTALL_DIR/.env" "$bk/"
   [[ -d "$INSTALL_DIR/static/uploads" ]] && cp -a "$INSTALL_DIR/static/uploads" "$bk/"
   return 0
