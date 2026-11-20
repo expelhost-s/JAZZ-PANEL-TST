@@ -260,7 +260,7 @@ install_apt() {
   fi
   ok "Core packages ready"
   local opt="iptables openssh-client e2fsprogs util-linux lsb-release"
-  (( RESTRICTED )) || opt+=" quota tmate snapd uidmap"     # snap/quota/uidmap need a real server
+  (( RESTRICTED )) || opt+=" quota tmate snapd uidmap btrfs-progs"     # snap/quota/uidmap need a real server; btrfs-progs = per-VPS dedicated disk pools
   info "Installing optional tools ($opt)"
   for p in $opt; do apt_install "$p" || warn "optional package $p not installed"; done
   quiet dpkg --configure -a --force-confdef --force-confold
@@ -591,7 +591,10 @@ setup_venv() {
 
 write_env() {
   local port="$1" user="$2" pass="$3" email="$4" name="$5" ip="$6" domain="${7:-}"
-  if [[ -f "$INSTALL_DIR/.env" ]]; then ok "Keeping existing configuration (.env)"; return; fi
+  if [[ -f "$INSTALL_DIR/.env" ]]; then
+    grep -q '^DEDICATED_DISK=' "$INSTALL_DIR/.env" 2>/dev/null || printf '\n# Dedicated storage: own disk pool per dedicated VPS (0 = shared pool)\nDEDICATED_DISK=1\nDEDICATED_POOL_DRIVERS=btrfs,zfs,lvm\n' >> "$INSTALL_DIR/.env"
+    ok "Keeping existing configuration (.env)"; return
+  fi
   local secret; secret="$(rand 48)"
   cat > "$INSTALL_DIR/.env" <<ENV
 # JAZZ VPS MANAGEMENT PANEL configuration  (edit, then: jazz-panel restart)
@@ -607,6 +610,10 @@ MAIN_ADMIN_EMAIL=$email
 YOUR_SERVER_IP=$ip
 PANEL_DOMAIN=$domain
 DEFAULT_STORAGE_POOL=default
+# Dedicated storage: every dedicated VPS gets its OWN disk pool of exactly its assigned size
+# (df -h inside the VPS shows the full assigned disk). 0 = old shared-pool mode.
+DEDICATED_DISK=1
+DEDICATED_POOL_DRIVERS=btrfs,zfs,lvm
 DEBUG_MODE=False
 AUTO_BACKUP_INTERVAL=3600
 STATS_UPDATE_INTERVAL=5
